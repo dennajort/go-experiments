@@ -5,12 +5,10 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"sync"
 )
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	raddr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:4242")
 	if err != nil {
 		log.Fatalln(err)
@@ -29,7 +27,8 @@ func main() {
 	go func() {
 		defer wg.Done()
 		io.CopyBuffer(os.Stdout, conn, make([]byte, 65536))
-		conn.CloseRead()
+		conn.Close()
+		os.Exit(1)
 	}()
 	wg.Wait()
 }
