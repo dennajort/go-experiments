@@ -1,2 +1,5 @@
 node_modules
 *.vmdk
+*.mp4
+go_client
+go_server
