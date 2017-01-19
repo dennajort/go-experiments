@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net"
+	"runtime"
 	"sync"
 )
 
@@ -138,6 +139,7 @@ func createTCPServer(coChan chan *net.TCPConn) error {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	r := newRoom()
 	go r.coLoop()
 	go r.broadcastLoop()
