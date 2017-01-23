@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"net"
-	"sync"
 )
 
 type client struct {
@@ -27,16 +26,16 @@ func (cli *client) close() {
 	cli.conn.Close()
 }
 
-func (cli *client) readLoop(rchan chan []byte, rmChan chan *client) {
+func (cli *client) readLoop(r *room) {
 	defer cli.conn.Close()
-	defer func() { rmChan <- cli }()
+	defer r.removeClient(cli)
 	buff := make([]byte, 65536)
 	for {
 		n, err := cli.conn.Read(buff)
 		if n > 0 {
 			msg := make([]byte, n)
 			copy(msg, buff[:n])
-			rchan <- msg
+			r.broadcast(msg)
 		}
 		if err != nil {
 			log.Println(err)
@@ -62,62 +61,56 @@ func (cli *client) id() string {
 }
 
 type room struct {
-	cls    []*client
-	rChan  chan []byte
-	coChan chan *net.TCPConn
-	rmChan chan *client
-	lock   *sync.RWMutex
+	cls     []*client
+	cmdChan chan func()
 }
 
 func newRoom() *room {
 	return &room{
-		cls:    make([]*client, 0),
-		rChan:  make(chan []byte),
-		coChan: make(chan *net.TCPConn),
-		rmChan: make(chan *client),
-		lock:   new(sync.RWMutex),
+		cls:     make([]*client, 0),
+		cmdChan: make(chan func()),
 	}
 }
 
-func (r *room) coLoop() {
-	for co := range r.coChan {
-		cli := newClient(co)
-		go cli.writeLoop()
-		r.lock.Lock()
+func (r *room) broadcast(msg []byte) {
+	r.cmdChan <- func() {
+		for _, cli := range r.cls {
+			cli.write(msg)
+		}
+	}
+}
+
+func (r *room) addClient(co *net.TCPConn) {
+	cli := newClient(co)
+	go cli.writeLoop()
+	r.cmdChan <- func() {
 		r.cls = append(r.cls, cli)
-		r.lock.Unlock()
-		go cli.readLoop(r.rChan, r.rmChan)
+		go cli.readLoop(r)
 		log.Printf("New client connected, now %d clients", len(r.cls))
 	}
 }
 
-func (r *room) broadcastLoop() {
-	for msg := range r.rChan {
-		r.lock.RLock()
-		for _, cli := range r.cls {
-			cli.write(msg)
-		}
-		r.lock.RUnlock()
-	}
-}
-
-func (r *room) rmLoop() {
-	for cli := range r.rmChan {
+func (r *room) removeClient(cli *client) {
+	r.cmdChan <- func() {
 		log.Println("Removing a client")
-		r.lock.Lock()
 		for i, c := range r.cls {
 			if c.id() == cli.id() {
 				r.cls = append(r.cls[:i], r.cls[i+1:]...)
 				break
 			}
 		}
-		r.lock.Unlock()
 		cli.close()
 		log.Printf("Client removed, %d client remaining", len(r.cls))
 	}
 }
 
-func createTCPServer(coChan chan *net.TCPConn) error {
+func (r *room) cmdLoop() {
+	for cmd := range r.cmdChan {
+		cmd()
+	}
+}
+
+func (r *room) listen() error {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", ":4242")
 	if err != nil {
 		return err
@@ -126,21 +119,18 @@ func createTCPServer(coChan chan *net.TCPConn) error {
 	if err != nil {
 		return err
 	}
-	defer close(coChan)
 	defer ln.Close()
 	for {
-		conn, err := ln.AcceptTCP()
+		co, err := ln.AcceptTCP()
 		if err != nil {
 			return err
 		}
-		coChan <- conn
+		r.addClient(co)
 	}
 }
 
 func main() {
 	r := newRoom()
-	go r.coLoop()
-	go r.broadcastLoop()
-	go r.rmLoop()
-	createTCPServer(r.coChan)
+	go r.cmdLoop()
+	r.listen()
 }
