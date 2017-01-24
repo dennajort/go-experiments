@@ -5,8 +5,9 @@ import (
 	"log"
 	"net"
 	"os"
-	"sync"
 )
+
+const bufferSize int64 = 1 << 16
 
 func main() {
 	raddr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:4242")
@@ -17,18 +18,10 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
-	wg := new(sync.WaitGroup)
-	wg.Add(2)
 	go func() {
-		defer wg.Done()
-		io.CopyBuffer(conn, os.Stdin, make([]byte, 65536))
+		io.CopyBuffer(conn, os.Stdin, make([]byte, bufferSize))
 		conn.CloseWrite()
 	}()
-	go func() {
-		defer wg.Done()
-		io.CopyBuffer(os.Stdout, conn, make([]byte, 65536))
-		conn.Close()
-		os.Exit(1)
-	}()
-	wg.Wait()
+	io.CopyBuffer(os.Stdout, conn, make([]byte, bufferSize))
+	conn.Close()
 }

@@ -5,6 +5,8 @@ import (
 	"net"
 )
 
+const bufferSize int64 = 1 << 16
+
 type client struct {
 	conn  *net.TCPConn
 	wchan chan []byte
@@ -29,7 +31,7 @@ func (cli *client) close() {
 func (cli *client) readLoop(r *room) {
 	defer cli.conn.Close()
 	defer r.removeClient(cli)
-	buff := make([]byte, 65536)
+	buff := make([]byte, bufferSize)
 	for {
 		n, err := cli.conn.Read(buff)
 		if n > 0 {
