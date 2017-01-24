@@ -3,3 +3,5 @@ node_modules
 *.mp4
 go_client
 go_server
+.idea
+.python-version
