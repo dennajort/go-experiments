@@ -10,17 +10,19 @@ class EchoProtocol(asyncio.Protocol):
     def __init__(self):
         self.transport = None  # type: asyncio.Transport
 
-    def connection_made(self, transport):
+    def connection_made(self, transport: asyncio.Transport):
         self.transport = transport
         clients.append(self)
         print("Client connected, %d clients" % len(clients))
 
-    def data_received(self, data):
+    def data_received(self, data: bytes):
         for client in clients:
             client.transport.write(data)
 
-    def connection_lost(self, exc):
+    def connection_lost(self, exc: Exception):
         clients.remove(self)
+        if exc is not None:
+            print(exc)
         print("Client disconnected, %d clients" % len(clients))
 
 
