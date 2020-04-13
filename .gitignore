@@ -6,3 +6,7 @@ go_server
 .idea
 .python-version
 *.mkv
+/tokio_client/target
+/tokio_server/target
+/rust_client/target
+/rust_server/target
