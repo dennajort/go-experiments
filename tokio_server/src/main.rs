@@ -9,93 +9,103 @@ use std::sync::Arc;
 
 use log::info;
 
-use tokio::io::{self, AsyncRead, AsyncWrite, BufReader, BufWriter};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::prelude::*;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 const BUFFER_SIZE: usize = 1 << 16;
 
-struct State<W> {
-    clients: HashMap<SocketAddr, W>,
+enum Event {
+    AddClient(SocketAddr, Sender<Arc<Vec<u8>>>),
+    Broadcast(Arc<Vec<u8>>),
+    RmClient(SocketAddr),
 }
 
-impl<W> State<W>
-where
-    W: AsyncWrite + Unpin,
-{
-    pub fn new() -> Self {
-        Self {
-            clients: HashMap::new(),
-        }
-    }
-
-    fn add_client(&mut self, addr: SocketAddr, writer: W) {
-        self.clients.insert(addr, writer);
-        info!("Client connected, currently {}", self.clients.len())
-    }
-
-    async fn remove_client(&mut self, addr: SocketAddr) {
-        if let Some(mut writer) = self.clients.remove(&addr) {
-            writer.flush().await.ok();
-        }
-        info!("Client disconnected, remaining {}", self.clients.len())
-    }
-
-    async fn broadcast(&mut self, msg: &[u8]) {
-        let mut deads = Vec::new();
-
-        for (addr, writer) in self.clients.iter_mut() {
-            match writer.write_all(msg).await {
-                Ok(_) => (),
-                Err(_) => {
-                    deads.push(addr.clone());
+async fn handle_events(rx: &mut Receiver<Event>) {
+    let mut clients = HashMap::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            Event::AddClient(addr, tx) => {
+                clients.insert(addr, tx);
+                info!("Client connected, currently {}", clients.len())
+            }
+            Event::RmClient(addr) => {
+                if let Some(_) = clients.remove(&addr) {
+                    info!("Client disconnected, remaining {}", clients.len())
+                }
+            }
+            Event::Broadcast(msg) => {
+                for tx in clients.values_mut() {
+                    tx.send(msg.clone()).await.ok();
                 }
             }
         }
-
-        for dead in deads {
-            self.remove_client(dead).await;
-        }
     }
 }
 
-async fn handle_reader<R, W>(addr: SocketAddr, reader: &mut R, state: Arc<Mutex<State<W>>>)
+async fn handle_reader<R>(addr: SocketAddr, reader: &mut R, tx: &mut Sender<Event>)
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     let mut buf = [0; BUFFER_SIZE];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => {
-                state.lock().await.broadcast(&buf[0..n]).await;
-            }
+            Ok(n) => match tx
+                .send(Event::Broadcast(Arc::new(buf[0..n].to_vec())))
+                .await
+            {
+                Ok(_) => (),
+                Err(_) => break,
+            },
             Err(_) => break,
         }
     }
-    state.lock().await.remove_client(addr).await;
+
+    tx.send(Event::RmClient(addr)).await.ok();
+}
+
+async fn handle_writer<W>(
+    addr: SocketAddr,
+    writer: &mut W,
+    tx: &mut Sender<Event>,
+    rx: &mut Receiver<Arc<Vec<u8>>>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(msg) = rx.recv().await {
+        match writer.write_all(msg.as_slice()).await {
+            Ok(_) => (),
+            Err(_) => break,
+        }
+    }
+    rx.close();
+
+    tx.send(Event::RmClient(addr)).await.ok();
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
-    let state = Arc::new(Mutex::new(State::new()));
     let mut listener = TcpListener::bind("127.0.0.1:4242").await?;
-
+    let (mut tx, mut rx) = mpsc::channel(1);
+    tokio::spawn(async move { handle_events(&mut rx).await });
     loop {
         let (stream, addr) = listener.accept().await?;
+        let (mut reader, mut writer) = io::split(stream);
+        let (tx2, mut rx2) = mpsc::channel(1);
 
-        let (reader, writer) = io::split(stream);
-        let mut reader = BufReader::with_capacity(BUFFER_SIZE, reader);
-        // let writer = BufWriter::new(writer);
-
-        state.lock().await.add_client(addr, writer);
+        tx.send(Event::AddClient(addr, tx2)).await.ok();
 
         {
-            let state = state.clone();
-            tokio::spawn(async move { handle_reader(addr, &mut reader, state).await });
+            let mut tx = tx.clone();
+            tokio::spawn(async move { handle_writer(addr, &mut writer, &mut tx, &mut rx2).await });
+        }
+
+        {
+            let mut tx = tx.clone();
+            tokio::spawn(async move { handle_reader(addr, &mut reader, &mut tx).await });
         }
     }
 }
