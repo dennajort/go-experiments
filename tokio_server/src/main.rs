@@ -5,19 +5,18 @@ extern crate tokio;
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::prelude::*;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use bytes::{BytesMut, Bytes};
+use bytes::{BytesMut, Bytes, Buf};
 
 const BUFFER_SIZE: usize = 1 << 16;
 
 #[derive(Debug)]
 enum Event {
-    AddClient(SocketAddr, Sender<Arc<Bytes>>),
-    Broadcast(Arc<Bytes>),
+    AddClient(SocketAddr, Sender<Bytes>),
+    Broadcast(Bytes),
     RmClient(SocketAddr),
 }
 
@@ -57,7 +56,7 @@ where
             Ok(n) => {
                 debug!("read {} bytes", n);
                 match tx
-                    .send(Event::Broadcast(Arc::new(buf.split().freeze())))
+                    .send(Event::Broadcast(buf.split().freeze()))
                     .await
                 {
                     Ok(_) => (),
@@ -81,17 +80,19 @@ async fn handle_writer<W>(
     addr: SocketAddr,
     writer: &mut W,
     tx: &mut Sender<Event>,
-    rx: &mut Receiver<Arc<Bytes>>,
+    rx: &mut Receiver<Bytes>,
 ) where
     W: AsyncWrite + Unpin,
 {
-    while let Some(msg) = rx.recv().await {
-        match writer.write_all(msg.as_ref()).await {
-            Ok(_) => (),
-            Err(e) => {
-                error!("writing {:?}", e);
-                break
-            },
+    while let Some(mut msg) = rx.recv().await {
+        while msg.has_remaining() {
+            match writer.write_buf(&mut msg).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("writing {:?}", e);
+                    break
+                },
+            }
         }
     }
     rx.close();
