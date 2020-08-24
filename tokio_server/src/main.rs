@@ -1,5 +1,5 @@
-extern crate log;
-extern crate pretty_env_logger;
+#[macro_use] extern crate log;
+extern crate env_logger;
 extern crate tokio;
 
 use std::collections::HashMap;
@@ -7,18 +7,17 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::info;
-
-use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::prelude::*;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use bytes::{BytesMut, Bytes};
 
 const BUFFER_SIZE: usize = 1 << 16;
 
+#[derive(Debug)]
 enum Event {
-    AddClient(SocketAddr, Sender<Arc<Vec<u8>>>),
-    Broadcast(Arc<Vec<u8>>),
+    AddClient(SocketAddr, Sender<Arc<Bytes>>),
+    Broadcast(Arc<Bytes>),
     RmClient(SocketAddr),
 }
 
@@ -48,18 +47,30 @@ async fn handle_reader<R>(addr: SocketAddr, reader: &mut R, tx: &mut Sender<Even
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = [0; BUFFER_SIZE];
+    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
     loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => match tx
-                .send(Event::Broadcast(Arc::new(buf[0..n].to_vec())))
-                .await
-            {
-                Ok(_) => (),
-                Err(_) => break,
+        match reader.read_buf(&mut buf).await {
+            Ok(0) => {
+                info!("connection closed");
+                break
             },
-            Err(_) => break,
+            Ok(n) => {
+                debug!("read {} bytes", n);
+                match tx
+                    .send(Event::Broadcast(Arc::new(buf.split().freeze())))
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(e) => {
+                        error!("broadcasting {:?}", e);
+                        break
+                    },
+                }
+            },
+            Err(e) => {
+                error!("reading {:?}", e);
+                break
+            },
         }
     }
 
@@ -70,14 +81,17 @@ async fn handle_writer<W>(
     addr: SocketAddr,
     writer: &mut W,
     tx: &mut Sender<Event>,
-    rx: &mut Receiver<Arc<Vec<u8>>>,
+    rx: &mut Receiver<Arc<Bytes>>,
 ) where
     W: AsyncWrite + Unpin,
 {
     while let Some(msg) = rx.recv().await {
-        match writer.write_all(msg.as_slice()).await {
+        match writer.write_all(msg.as_ref()).await {
             Ok(_) => (),
-            Err(_) => break,
+            Err(e) => {
+                error!("writing {:?}", e);
+                break
+            },
         }
     }
     rx.close();
@@ -87,7 +101,7 @@ async fn handle_writer<W>(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    pretty_env_logger::init();
+    env_logger::init();
     let mut listener = TcpListener::bind("127.0.0.1:4242").await?;
     let (mut tx, mut rx) = mpsc::channel(1);
     tokio::spawn(async move { handle_events(&mut rx).await });

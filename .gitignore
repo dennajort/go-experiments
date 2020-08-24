@@ -10,3 +10,4 @@ go_server
 /tokio_server/target
 /rust_client/target
 /rust_server/target
+/ramdisk
