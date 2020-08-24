@@ -1,7 +1,10 @@
 extern crate tokio;
 
-use tokio::io::{self, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{self, AsyncWriteExt, AsyncReadExt};
 use tokio::net::TcpStream;
+use bytes::{BytesMut, Buf};
+
+const BUFFER_SIZE: usize = 1 << 16;
 
 #[tokio::main]
 async fn main() {
@@ -9,18 +12,45 @@ async fn main() {
         .await
         .expect("cannot connect");
 
-    let (reader, writer) = io::split(stream);
+    let (mut reader, mut writer) = io::split(stream);
 
     let write_thr = tokio::spawn(async move {
-        let mut stdin = BufReader::new(io::stdin());
-        let mut writer = BufWriter::new(writer);
-        io::copy(&mut stdin, &mut writer).await.ok();
+        let mut buffer = BytesMut::with_capacity(BUFFER_SIZE);
+        let mut stdin = io::stdin();
+        loop {
+            match stdin.read_buf(&mut buffer).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    while buffer.has_remaining() {
+                        match writer.write_buf(&mut buffer).await {
+                            Ok(_) => (),
+                            Err(_) => break,
+                        }
+                    }
+                },
+                Err(_) => break,
+            }
+        }
         writer.shutdown().await.ok();
     });
     let read_thr = tokio::spawn(async move {
-        let mut stdout = BufWriter::new(io::stdout());
-        let mut reader = BufReader::new(reader);
-        io::copy(&mut reader, &mut stdout).await.ok();
+        let mut buffer = BytesMut::with_capacity(BUFFER_SIZE);
+        let mut stdout = io::stdout();
+        loop {
+            match reader.read_buf(&mut buffer).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    while buffer.has_remaining() {
+                        match stdout.write_buf(&mut buffer).await {
+                            Ok(_) => (),
+                            Err(_) => break,
+                        }
+                    }
+                },
+                Err(_) => break,
+            }
+        }
+
         stdout.shutdown().await.ok();
     });
 
