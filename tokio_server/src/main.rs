@@ -3,9 +3,8 @@ extern crate log;
 extern crate env_logger;
 extern crate tokio;
 
-use std::collections::{HashMap, LinkedList};
+use std::collections::LinkedList;
 use std::error::Error;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -17,35 +16,36 @@ use tokio::io::{self, AsyncWriteExt, AsyncReadExt};
 const BUFFER_SIZE: usize = 1 << 16;
 
 struct Server {
-    clients: Mutex<HashMap<SocketAddr, Sender<Bytes>>>,
+    clients: Mutex<LinkedList<Sender<Bytes>>>,
 }
 
 impl Server {
     pub fn new() -> Server {
         Server {
-            clients: Mutex::new(HashMap::new()),
+            clients: Mutex::new(LinkedList::new()),
         }
     }
 
     pub async fn broadcast(&self, msg: Bytes) {
         let mut clients = self.clients.lock().await;
-        let mut to_remove = LinkedList::new();
-        for (addr, tx) in clients.iter() {
-            if let Err(_e) = tx.send(msg.clone()).await{
-                // error!("sending to writer {:?}", e);
-                to_remove.push_front(addr.clone());
-            };
-        }
-
-        while let Some(addr) = to_remove.pop_front() {
-            clients.remove(&addr);
-            info!("Client disconnected, remaining {}", clients.len());
+        let count = clients.len();
+        for _ in 0..count {
+            if let Some(tx) = clients.pop_front() {
+                match tx.send(msg.clone()).await {
+                    Ok(_) => {
+                        clients.push_back(tx);
+                    }
+                    Err(_) => {
+                        info!("Client disconnected, remaining {}", clients.len());
+                    }
+                }
+            }
         }
     }
 
-    pub async fn add_client(&self, addr: SocketAddr, tx: Sender<Bytes>) {
+    pub async fn add_client(&self, tx: Sender<Bytes>) {
         let mut clients = self.clients.lock().await;
-        clients.insert(addr, tx);
+        clients.push_back(tx);
         info!("Client connected, currently {}", clients.len());
     }
 }
@@ -95,10 +95,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let server = Arc::new(Server::new());
     let listener = TcpListener::bind("127.0.0.1:4242").await?;
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         let (mut reader, mut writer) = io::split(stream);
         let (tx, mut rx) = mpsc::channel(1);
-        server.add_client(addr, tx).await;
+        server.add_client(tx).await;
 
         tokio::spawn(async move { handle_writer(&mut writer, &mut rx).await });
 
