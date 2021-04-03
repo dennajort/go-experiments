@@ -3,16 +3,16 @@ extern crate log;
 extern crate env_logger;
 extern crate tokio;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, LinkedList};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::net::TcpListener;
-use tokio::prelude::*;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Mutex;
+use tokio::io::{self, AsyncWriteExt, AsyncReadExt};
 
 const BUFFER_SIZE: usize = 1 << 16;
 
@@ -29,8 +29,17 @@ impl Server {
 
     pub async fn broadcast(&self, msg: Bytes) {
         let mut clients = self.clients.lock().await;
-        for tx in clients.values_mut() {
-            tx.send(msg.clone()).await.ok();
+        let mut to_remove = LinkedList::new();
+        for (addr, tx) in clients.iter() {
+            if let Err(_e) = tx.send(msg.clone()).await{
+                // error!("sending to writer {:?}", e);
+                to_remove.push_front(addr.clone());
+            };
+        }
+
+        while let Some(addr) = to_remove.pop_front() {
+            clients.remove(&addr);
+            info!("Client disconnected, remaining {}", clients.len());
         }
     }
 
@@ -39,18 +48,11 @@ impl Server {
         clients.insert(addr, tx);
         info!("Client connected, currently {}", clients.len());
     }
-
-    pub async fn remove_client(&self, addr: SocketAddr) {
-        let mut clients = self.clients.lock().await;
-        if let Some(_) = clients.remove(&addr) {
-            info!("Client disconnected, remaining {}", clients.len());
-        }
-    }
 }
 
 async fn handle_reader<R>(reader: &mut R, server: Arc<Server>)
 where
-    R: AsyncRead + Unpin,
+    R: AsyncReadExt + Unpin,
 {
     let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
     loop {
@@ -72,43 +74,33 @@ where
 }
 
 async fn handle_writer<W>(
-    addr: SocketAddr,
     writer: &mut W,
-    server: Arc<Server>,
     rx: &mut Receiver<Bytes>,
 ) where
-    W: AsyncWrite + Unpin,
+    W: AsyncWriteExt + Unpin,
 {
     while let Some(mut msg) = rx.recv().await {
         while msg.has_remaining() {
-            match writer.write_buf(&mut msg).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("writing {:?}", e);
-                    break;
-                }
+            if let Err(_e) = writer.write_buf(&mut msg).await{
+                // error!("writing {:?}", e);
+                return;
             }
         }
     }
-    rx.close();
-    server.remove_client(addr).await;
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     let server = Arc::new(Server::new());
-    let mut listener = TcpListener::bind("127.0.0.1:4242").await?;
+    let listener = TcpListener::bind("127.0.0.1:4242").await?;
     loop {
         let (stream, addr) = listener.accept().await?;
         let (mut reader, mut writer) = io::split(stream);
         let (tx, mut rx) = mpsc::channel(1);
         server.add_client(addr, tx).await;
 
-        {
-            let server = server.clone();
-            tokio::spawn(async move { handle_writer(addr, &mut writer, server, &mut rx).await });
-        }
+        tokio::spawn(async move { handle_writer(&mut writer, &mut rx).await });
 
         {
             let server = server.clone();
