@@ -5,53 +5,54 @@ extern crate tokio;
 
 use std::collections::LinkedList;
 use std::error::Error;
-use std::sync::Arc;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::Mutex;
 use tokio::io::{self, AsyncWriteExt, AsyncReadExt};
 
 const BUFFER_SIZE: usize = 1 << 16;
 
-struct Server {
-    clients: Mutex<LinkedList<Sender<Bytes>>>,
+#[derive(Debug)]
+enum Action {
+    Broadcast(Bytes),
+    AddClient(Sender<Bytes>),
 }
 
-impl Server {
-    pub fn new() -> Server {
-        Server {
-            clients: Mutex::new(LinkedList::new()),
-        }
-    }
-
-    pub async fn broadcast(&self, msg: Bytes) {
-        let mut clients = self.clients.lock().await;
-        let count = clients.len();
-        for _ in 0..count {
-            if let Some(tx) = clients.pop_front() {
-                match tx.send(msg.clone()).await {
-                    Ok(_) => {
-                        clients.push_back(tx);
-                    }
-                    Err(_) => {
-                        info!("Client disconnected, remaining {}", clients.len());
+async fn handle_manager(mut rx: Receiver<Action>) {
+    let mut clients = LinkedList::new();
+    loop {
+        match rx.recv().await {
+            Some(Action::AddClient(tx)) => {
+                clients.push_back(tx);
+                info!("Client connected, currently {}", clients.len());
+            }
+            Some(Action::Broadcast(msg)) => {
+                let count = clients.len();
+                for _ in 0..count {
+                    if let Some(tx) = clients.pop_front() {
+                        match tx.send(msg.clone()).await {
+                            Ok(_) => {
+                                clients.push_back(tx);
+                            }
+                            Err(_) => {
+                                info!("Client disconnected, remaining {}", clients.len());
+                            }
+                        }
                     }
                 }
             }
+            None => {
+                return;
+            }
         }
-    }
-
-    pub async fn add_client(&self, tx: Sender<Bytes>) {
-        let mut clients = self.clients.lock().await;
-        clients.push_back(tx);
-        info!("Client connected, currently {}", clients.len());
     }
 }
 
-async fn handle_reader<R>(reader: &mut R, server: Arc<Server>)
-where
+async fn handle_reader<R>(
+    reader: &mut R,
+    tx: &mut Sender<Action>,
+) where
     R: AsyncReadExt + Unpin,
 {
     let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
@@ -59,15 +60,18 @@ where
         match reader.read_buf(&mut buf).await {
             Ok(0) => {
                 info!("connection closed");
-                break;
+                return;
             }
             Ok(n) => {
                 debug!("read {} bytes", n);
-                server.broadcast(buf.split().freeze()).await;
+                if let Err(e) = tx.send(Action::Broadcast(buf.split().freeze())).await {
+                    error!("sending to manager {:?}", e);
+                    return
+                }
             }
             Err(e) => {
                 error!("reading {:?}", e);
-                break;
+                return;
             }
         }
     }
@@ -80,11 +84,9 @@ async fn handle_writer<W>(
     W: AsyncWriteExt + Unpin,
 {
     while let Some(mut msg) = rx.recv().await {
-        while msg.has_remaining() {
-            if let Err(_e) = writer.write_buf(&mut msg).await{
-                // error!("writing {:?}", e);
-                return;
-            }
+        if let Err(_e) = writer.write_all(&mut msg).await{
+            // error!("writing {:?}", e);
+            return;
         }
     }
 }
@@ -92,19 +94,23 @@ async fn handle_writer<W>(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
-    let server = Arc::new(Server::new());
+    let (stx, srx) = mpsc::channel(1);
+
+    tokio::spawn(async move { handle_manager(srx).await });
+
     let listener = TcpListener::bind("127.0.0.1:4242").await?;
+
     loop {
         let (stream, _) = listener.accept().await?;
         let (mut reader, mut writer) = io::split(stream);
         let (tx, mut rx) = mpsc::channel(1);
-        server.add_client(tx).await;
+        stx.send(Action::AddClient(tx)).await?;
 
         tokio::spawn(async move { handle_writer(&mut writer, &mut rx).await });
 
         {
-            let server = server.clone();
-            tokio::spawn(async move { handle_reader(&mut reader, server).await });
+            let mut tx = stx.clone();
+            tokio::spawn(async move { handle_reader(&mut reader, &mut tx).await });
         }
     }
 }
