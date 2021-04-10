@@ -17,37 +17,30 @@ async fn main() {
     let write_thr = tokio::spawn(async move {
         let mut buffer = BytesMut::with_capacity(BUFFER_SIZE);
         let mut stdin = io::stdin();
-        loop {
+        'wLoop: loop {
             match stdin.read_buf(&mut buffer).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    while buffer.has_remaining() {
-                        match writer.write_buf(&mut buffer).await {
-                            Ok(_) => (),
-                            Err(_) => break,
-                        }
-                    }
+                Ok(0) => break 'wLoop,
+                Ok(_) => match writer.write_all(&mut buffer).await {
+                    Ok(_) => buffer.clear(),
+                    Err(_) => break 'wLoop,
                 },
-                Err(_) => break,
+                Err(_) => break 'wLoop,
             }
         }
         writer.shutdown().await.ok();
     });
+
     let read_thr = tokio::spawn(async move {
         let mut buffer = BytesMut::with_capacity(BUFFER_SIZE);
         let mut stdout = io::stdout();
-        loop {
+        'rLoop: loop {
             match reader.read_buf(&mut buffer).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    while buffer.has_remaining() {
-                        match stdout.write_buf(&mut buffer).await {
-                            Ok(_) => (),
-                            Err(_) => break,
-                        }
-                    }
+                Ok(0) => break 'rLoop,
+                Ok(_) => match stdout.write_all(&mut buffer).await {
+                    Ok(_) => buffer.clear(),
+                    Err(_) => break 'rLoop,
                 },
-                Err(_) => break,
+                Err(_) => break 'rLoop,
             }
         }
 
